@@ -11,6 +11,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cerrno>
@@ -26,6 +27,13 @@
 namespace {
 constexpr const char* kUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
+
+std::string media_proxy(const std::string& proxy, const std::string& url) {
+    std::string lower = url;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return lower.find("udemycdn.com") != std::string::npos ? std::string{} : proxy;
+}
 
 struct CurlHandle {
     CURL* value = curl_easy_init();
@@ -326,10 +334,11 @@ bool fetch_manifest(
     curl_easy_setopt(curl.value, CURLOPT_HTTPHEADER, header_list);
     curl_easy_setopt(curl.value, CURLOPT_WRITEFUNCTION, write_string);
     curl_easy_setopt(curl.value, CURLOPT_WRITEDATA, &body);
+    const std::string effective_proxy = media_proxy(proxy, url);
     curl_easy_setopt(curl.value, CURLOPT_CONNECTTIMEOUT_MS, 10000L);
     curl_easy_setopt(curl.value, CURLOPT_TIMEOUT_MS, 30000L);
-    if (!proxy.empty()) {
-        curl_easy_setopt(curl.value, CURLOPT_PROXY, proxy.c_str());
+    if (!effective_proxy.empty()) {
+        curl_easy_setopt(curl.value, CURLOPT_PROXY, effective_proxy.c_str());
         curl_easy_setopt(curl.value, CURLOPT_SSL_VERIFYPEER, 0L);
         curl_easy_setopt(curl.value, CURLOPT_SSL_VERIFYHOST, 0L);
     }
@@ -349,12 +358,16 @@ bool fetch_manifest(
 struct ProgressContext {
     std::function<bool(double, double)>* callback = nullptr;
     long long completed_bytes = 0;
+    std::atomic_bool* cancelled = nullptr;
 };
 
 int transfer_progress(void* userdata, curl_off_t, curl_off_t downloaded, curl_off_t, curl_off_t) {
     auto* context = static_cast<ProgressContext*>(userdata);
+    if (context->cancelled && context->cancelled->load()) return 1;
     if (!context->callback || !*context->callback) return 0;
-    return (*context->callback)(static_cast<double>(context->completed_bytes + downloaded), 0.0) ? 0 : 1;
+    if ((*context->callback)(static_cast<double>(context->completed_bytes + downloaded), 0.0)) return 0;
+    if (context->cancelled) context->cancelled->store(true);
+    return 1;
 }
 
 bool append_url(
@@ -375,6 +388,7 @@ bool append_url(
         for (const auto& header : headers) header_list = curl_slist_append(header_list, header.c_str());
         std::string payload;
         ProgressContext progress_context{ &callback, bytes };
+        const std::string effective_proxy = media_proxy(proxy, url);
 
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
         curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
@@ -390,8 +404,8 @@ bool append_url(
         curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 10000L);
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 0L);
         curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
-        if (!proxy.empty()) {
-            curl_easy_setopt(curl, CURLOPT_PROXY, proxy.c_str());
+        if (!effective_proxy.empty()) {
+            curl_easy_setopt(curl, CURLOPT_PROXY, effective_proxy.c_str());
             curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
             curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
         }
@@ -412,6 +426,63 @@ bool append_url(
             bytes += static_cast<long long>(payload.size());
             return true;
         }
+
+        msg = result != CURLE_OK
+            ? curl_easy_strerror(result)
+            : "segment request returned HTTP " + std::to_string(response_code);
+        if (attempt < 3) std::this_thread::sleep_for(std::chrono::milliseconds(300 * attempt));
+    }
+    return false;
+}
+
+bool fetch_segment(
+    const std::string& url,
+    const std::vector<std::string>& headers,
+    const std::string& proxy,
+    std::function<bool(double, double)>& callback,
+    long long completed_bytes,
+    std::atomic_bool& cancelled,
+    std::string& payload,
+    std::string& msg) {
+    for (int attempt = 1; attempt <= 3; ++attempt) {
+        if (cancelled.load()) { msg = "Operation aborted by user"; return false; }
+        CurlHandle curl;
+        if (!curl.value) { msg = "curl init failed"; return false; }
+        curl_slist* header_list = nullptr;
+        for (const auto& header : headers) header_list = curl_slist_append(header_list, header.c_str());
+        payload.clear();
+        ProgressContext progress_context{ &callback, completed_bytes, &cancelled };
+        const std::string effective_proxy = media_proxy(proxy, url);
+
+        curl_easy_setopt(curl.value, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl.value, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl.value, CURLOPT_MAXREDIRS, 8L);
+        curl_easy_setopt(curl.value, CURLOPT_USERAGENT, kUserAgent);
+        curl_easy_setopt(curl.value, CURLOPT_ACCEPT_ENCODING, "");
+        curl_easy_setopt(curl.value, CURLOPT_HTTPHEADER, header_list);
+        curl_easy_setopt(curl.value, CURLOPT_WRITEFUNCTION, write_string);
+        curl_easy_setopt(curl.value, CURLOPT_WRITEDATA, &payload);
+        curl_easy_setopt(curl.value, CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(curl.value, CURLOPT_XFERINFOFUNCTION, transfer_progress);
+        curl_easy_setopt(curl.value, CURLOPT_XFERINFODATA, &progress_context);
+        curl_easy_setopt(curl.value, CURLOPT_CONNECTTIMEOUT_MS, 10000L);
+        curl_easy_setopt(curl.value, CURLOPT_TIMEOUT, 0L);
+        curl_easy_setopt(curl.value, CURLOPT_TCP_KEEPALIVE, 1L);
+        if (!effective_proxy.empty()) {
+            curl_easy_setopt(curl.value, CURLOPT_PROXY, effective_proxy.c_str());
+            curl_easy_setopt(curl.value, CURLOPT_SSL_VERIFYPEER, 0L);
+            curl_easy_setopt(curl.value, CURLOPT_SSL_VERIFYHOST, 0L);
+        }
+
+        const CURLcode result = curl_easy_perform(curl.value);
+        long response_code = 0;
+        curl_easy_getinfo(curl.value, CURLINFO_RESPONSE_CODE, &response_code);
+        if (header_list) curl_slist_free_all(header_list);
+        if (result == CURLE_ABORTED_BY_CALLBACK || cancelled.load()) {
+            msg = "Operation aborted by user";
+            return false;
+        }
+        if (result == CURLE_OK && response_code >= 200 && response_code < 300) return true;
 
         msg = result != CURLE_OK
             ? curl_easy_strerror(result)
@@ -455,13 +526,68 @@ bool download_representation(
         return close_and_fail();
     }
 
-    for (std::size_t index = 0; index < segments.timeline.size(); ++index) {
-        const long long number = segments.start_number + static_cast<long long>(index);
-        const std::string media = substitute_template(segments.media, representation,
-            number, segments.timeline[index]);
-        if (!append_url(curl.value, resolve_url(mpd_url, media), file, total_bytes, headers, proxy, callback, msg)) {
-            msg = "media segment " + std::to_string(number) + " for representation " +
-                representation.id + ": " + msg;
+    constexpr std::size_t kMinimumParallelSegments = 2;
+    constexpr std::size_t kInitialParallelSegments = 4;
+    constexpr std::size_t kMaximumParallelSegments = 8;
+    std::size_t parallel_segments = kInitialParallelSegments;
+    for (std::size_t batch_start = 0; batch_start < segments.timeline.size(); batch_start += parallel_segments) {
+        const auto batch_started = std::chrono::steady_clock::now();
+        const std::size_t batch_end = std::min(batch_start + parallel_segments, segments.timeline.size());
+        const std::size_t batch_count = batch_end - batch_start;
+        std::vector<std::string> payloads(batch_count);
+        std::vector<std::string> errors(batch_count);
+        std::atomic_bool cancelled{false};
+        std::atomic<long long> batch_downloaded{0};
+        std::vector<std::thread> workers;
+        workers.reserve(batch_count);
+
+        for (std::size_t local = 0; local < batch_count; ++local) {
+            workers.emplace_back([&, local] {
+                if (cancelled.load()) return;
+                const std::size_t index = batch_start + local;
+                const long long number = segments.start_number + static_cast<long long>(index);
+                const std::string media = substitute_template(segments.media, representation,
+                    number, segments.timeline[index]);
+                long long last_downloaded = 0;
+                std::function<bool(double, double)> worker_callback = [&](double reported_total, double) {
+                    const long long downloaded = std::max(0LL,
+                        static_cast<long long>(reported_total) - total_bytes);
+                    const long long delta = downloaded - last_downloaded;
+                    last_downloaded = downloaded;
+                    if (delta > 0) batch_downloaded.fetch_add(delta);
+                    return !cancelled.load() && (!callback || callback(
+                        static_cast<double>(total_bytes + batch_downloaded.load()), 0.0));
+                };
+                if (!fetch_segment(resolve_url(mpd_url, media), headers, proxy, worker_callback,
+                    total_bytes, cancelled, payloads[local], errors[local])) {
+                    cancelled.store(true);
+                }
+            });
+        }
+        for (auto& worker : workers) worker.join();
+
+        if (cancelled.load()) {
+            auto error = std::find_if(errors.begin(), errors.end(), [](const auto& value) { return !value.empty(); });
+            msg = error != errors.end() ? *error : "Operation aborted by user";
+            return close_and_fail();
+        }
+        const auto batch_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - batch_started).count();
+        if (batch_elapsed < 1200 && parallel_segments < kMaximumParallelSegments) {
+            ++parallel_segments;
+        }
+        else if (batch_elapsed > 4000 && parallel_segments > kMinimumParallelSegments) {
+            --parallel_segments;
+        }
+        for (const auto& payload : payloads) {
+            if (std::fwrite(payload.data(), 1, payload.size(), file) != payload.size()) {
+                msg = "failed to write encrypted segment";
+                return close_and_fail();
+            }
+            total_bytes += static_cast<long long>(payload.size());
+        }
+        if (callback && !callback(static_cast<double>(total_bytes), 0.0)) {
+            msg = "Operation aborted by user";
             return close_and_fail();
         }
     }

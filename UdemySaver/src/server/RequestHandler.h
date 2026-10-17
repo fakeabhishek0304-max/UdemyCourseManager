@@ -119,6 +119,7 @@ private:
 	std::string api_base_;  // settings: udemy_api_base (default https://www.udemy.com)
 	std::string api_host_;
 	std::string proxy_;     // settings: http_proxy (optional)
+	std::string download_dir_ = "downloads"; // settings: download_dir
 	bool download_subtitles_ = true; // settings: download_subtitles
 	bool download_assets_ = true; // settings: download_assets
 

@@ -48,6 +48,7 @@
   "options.assets": "Download assets",
   "options.language": "Language",
   "options.quality": "Video quality",
+  "options.download_dir": "Download folder",
   "settings.title": "Settings",
   "queue.speed": "Speed: {speed}/s",
   "queue.sections": "Files",

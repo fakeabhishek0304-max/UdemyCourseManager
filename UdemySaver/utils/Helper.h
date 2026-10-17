@@ -96,6 +96,18 @@ namespace Helper
 		return ss.str();
 	}
 
+	inline std::string course_dir(const std::string& root, int course_id, const std::string& title) {
+		std::string safe_title = slugify(title);
+		if (safe_title.size() > 50) safe_title = safe_title.substr(0, 50);
+
+		std::string base = root.empty() ? "downloads" : root;
+		while (base.size() > 1 && (base.back() == '/' || base.back() == '\\')) base.pop_back();
+
+		std::ostringstream ss;
+		ss << base << "/" << safe_title << "-" << course_id;
+		return ss.str();
+	}
+
 	inline std::string trim(std::string s) {
 		auto ws = [](int c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
 		while (!s.empty() && ws(static_cast<unsigned char>(s.front()))) s.erase(s.begin());

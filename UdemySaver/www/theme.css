@@ -439,6 +439,14 @@ a {
     font-weight: 600;
 }
 
+.setting-folder {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    font-size: 13px;
+    font-weight: 600;
+}
+
 .setting-cb {
     display: flex;
     align-items: center;
@@ -470,6 +478,23 @@ a {
     font-size: 13px;
     font-weight: 600;
     cursor: pointer;
+}
+
+.styled-input {
+    width: 100%;
+    box-sizing: border-box;
+    background: rgb(0 0 0 / 50%);
+    color: var(--text-main);
+    border: 1px solid var(--border-glass);
+    padding: 8px 12px;
+    border-radius: var(--radius-md);
+    outline: none;
+    font-family: inherit;
+    font-size: 13px;
+}
+
+.styled-input:focus {
+    border-color: var(--accent-1);
 }
 
     .styled-select:focus {

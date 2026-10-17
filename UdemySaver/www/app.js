@@ -66,8 +66,8 @@ const authWarn = $('#authWarn'), authPill = $('#auth-pill');
 const userbox = $('#userbox'), avatar = $('#avatar'), uname = $('#uname'), signOutBtn = $('#signOutBtn');
 const countInfo = $('#countInfo'), qInput = $('#q');
 const settingsBtn = $('#settingsBtn'), settingsPanel = $('#settingsPanel'), settingsCloseBtn = $('#settingsCloseBtn');
-const optSubs = $('#optSubs'), optAssets = $('#optAssets'), optQuality = $('#optQuality');
-let userOpts = {subs:false, assets:false};
+const optSubs = $('#optSubs'), optAssets = $('#optAssets'), optQuality = $('#optQuality'), downloadDir = $('#downloadDir');
+let userOpts = {subs:false, assets:false, download_dir:'downloads'};
 const selectedCourses = new Map();
 const courseCollectionControllers = new Map();
 
@@ -114,6 +114,7 @@ async function saveOpts(){
         body: JSON.stringify({
             download_subtitles: userOpts.subs,
             download_assets: userOpts.assets,
+            download_dir: (downloadDir?.value || 'downloads').trim(),
             quality
         })
     }).catch(()=>({}));
@@ -212,8 +213,10 @@ async function loadSession(){
     if(data.opts){
       userOpts.subs = !!data.opts.subs;
       userOpts.assets = !!data.opts.assets;
+      userOpts.download_dir = data.opts.download_dir || 'downloads';
       if(optSubs) optSubs.checked = userOpts.subs;
       if(optAssets) optAssets.checked = userOpts.assets;
+      if(downloadDir) downloadDir.value = userOpts.download_dir;
     }
     if(data.auth && data.user){
         if (userbox) userbox.style.display = 'flex';
@@ -563,6 +566,7 @@ async function queueWholeCourse(course, preference="720"){
 
 /* ===== course total size (lazy) ===== */
 const __courseSize = new Map();
+const __queueSpeed = new Map();
 async function estimateCourseSize(courseId, quality){ return await getJSON(`/estimate?course_id=${courseId}&quality=${encodeURIComponent(quality||'720')}`); }
 async function ensureCourseSize(courseId, quality){ const entry = __courseSize.get(courseId); if(entry && (entry.pending || entry.bytes>0)) return; __courseSize.set(courseId,{bytes:0,pending:true}); const j = await estimateCourseSize(courseId, quality); __courseSize.set(courseId,{bytes:(j && j.total_bytes)||0,pending:false}); }
 
@@ -592,7 +596,15 @@ async function qTick(force=false){
             const st=String(it.state||'').toLowerCase(), r=rank[st]??0;
             if(r>row._r){ row.state=st||'queued'; row._r=r; }
             if(st==='downloading'){
-                const spd = it.speed_bps || 0; 
+                const now = performance.now();
+                const currentBytes = Number(it.bytes_now) || 0;
+                const previous = __queueSpeed.get(it.id);
+                let measured = 0;
+                if(previous && now > previous.time && currentBytes >= previous.bytes){
+                    measured = (currentBytes - previous.bytes) * 1000 / (now - previous.time);
+                }
+                __queueSpeed.set(it.id, {bytes: currentBytes, time: now});
+                const spd = Math.max(Number(it.speed_bps) || 0, measured);
                 row.speed = (row.speed||0) + spd;
                 if(it.filename) row.active_files.push(it.filename);
             }
@@ -706,6 +718,7 @@ if(settingsCloseBtn && settingsPanel) settingsCloseBtn.addEventListener('click',
 if(optSubs) optSubs.addEventListener('change', saveOpts);
 if(optAssets) optAssets.addEventListener('change', saveOpts);
 if(optQuality) optQuality.addEventListener('change', saveOpts);
+if(downloadDir) downloadDir.addEventListener('change', saveOpts);
 
 document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) qTick(true); });
 window.addEventListener('load', ()=>{ const btn = document.getElementById('saveTokenBtn'); if(btn) btn.addEventListener('click', saveTokenFromUI); });

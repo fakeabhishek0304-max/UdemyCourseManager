@@ -269,6 +269,7 @@ void RequestHandler::load_settings() {
 			f << "udemy_client_id=\n";
 			f << "udemy_api_base=https://www.udemy.com\n";
 			f << "# http_proxy=\n";
+			f << "download_dir=downloads\n";
 			f << "download_subtitles=true\n";
 			f << "download_assets=true\n";
 		}
@@ -277,6 +278,7 @@ void RequestHandler::load_settings() {
 		client_id_.clear();
 		api_base_ = "https://www.udemy.com";
 		proxy_.clear();
+		download_dir_ = "downloads";
 		download_subtitles_ = true;
 		download_assets_ = true;
 		return;
@@ -314,6 +316,11 @@ void RequestHandler::load_settings() {
 
 	if (kv.count("http_proxy")) proxy_ = kv["http_proxy"];
 	else if (kv.count("proxy")) proxy_ = kv["proxy"];
+
+	if (kv.count("download_dir")) {
+		download_dir_ = Helper::trim(kv["download_dir"]);
+		if (download_dir_.empty()) download_dir_ = "downloads";
+	}
 
 	if (kv.count("download_subtitles"))
 	{
@@ -405,7 +412,7 @@ std::pair<status, std::string> RequestHandler::handleSession() {
 	out["ok"] = true;
 	out["source"] = "settings";
 	out["auth"] = !token_.empty();
-	out["opts"] = { {"subs", download_subtitles_}, {"assets", download_assets_} };
+	out["opts"] = { {"subs", download_subtitles_}, {"assets", download_assets_}, {"download_dir", download_dir_} };
 
 	if (token_.empty())
 	{
@@ -445,6 +452,7 @@ std::pair<boost::beast::http::status, std::string> RequestHandler::handleSetting
 		std::string new_client_id = client_id_;
 		bool new_subs = download_subtitles_;
 		bool new_assets = download_assets_;
+		std::string new_download_dir = download_dir_;
 
 		if (in.contains("udemy_access_token")) new_token = in.value("udemy_access_token", std::string{});
 		if (in.contains("udemy_api_base"))    new_api = in.value("udemy_api_base", std::string{});
@@ -452,6 +460,7 @@ std::pair<boost::beast::http::status, std::string> RequestHandler::handleSetting
 		if (in.contains("udemy_client_id"))   new_client_id = in.value("udemy_client_id", std::string{});
 		if (in.contains("download_subtitles")) new_subs = in.value("download_subtitles", false);
 		if (in.contains("download_assets"))    new_assets = in.value("download_assets", false);
+		if (in.contains("download_dir"))      new_download_dir = in.value("download_dir", std::string{});
 
 		auto trim2 = [](std::string s)
 			{
@@ -464,7 +473,9 @@ std::pair<boost::beast::http::status, std::string> RequestHandler::handleSetting
 		new_api = trim2(new_api);
 		new_proxy = trim2(new_proxy);
 		new_client_id = trim2(new_client_id);
+		new_download_dir = trim2(new_download_dir);
 		if (new_api.empty()) new_api = "https://www.udemy.com";
+		if (new_download_dir.empty()) new_download_dir = "downloads";
 
 		{
 			std::ofstream f("settings.ini", std::ios::binary);
@@ -476,8 +487,9 @@ std::pair<boost::beast::http::status, std::string> RequestHandler::handleSetting
 			f << "# UdemySaver settings\n";
 			f << "udemy_access_token=" << new_token << "\n";
 			f << "udemy_client_id=" << new_client_id << "\n";
-			f << "udemy_api_base=" << new_api << "\n";
-			if (!new_proxy.empty()) f << "http_proxy=" << new_proxy << "\n";
+		f << "udemy_api_base=" << new_api << "\n";
+		if (!new_proxy.empty()) f << "http_proxy=" << new_proxy << "\n";
+		f << "download_dir=" << new_download_dir << "\n";
 			f << "download_subtitles=" << (new_subs ? "true" : "false") << "\n";
 			f << "download_assets=" << (new_assets ? "true" : "false") << "\n";
 			f.flush();
@@ -487,12 +499,13 @@ std::pair<boost::beast::http::status, std::string> RequestHandler::handleSetting
 		client_id_ = new_client_id;
 		api_base_ = new_api;
 		proxy_ = new_proxy;
+		download_dir_ = new_download_dir;
 		download_subtitles_ = new_subs;
 		download_assets_ = new_assets;
 
 		out["ok"] = true;
 		out["auth"] = !token_.empty();
-		out["opts"] = { {"subs", download_subtitles_}, {"assets", download_assets_} };
+		out["opts"] = { {"subs", download_subtitles_}, {"assets", download_assets_}, {"download_dir", download_dir_} };
 		return { status::ok, out.dump() };
 	}
 	catch (const std::exception& e)
@@ -549,20 +562,26 @@ RequestHandler::handleCourses(int page, int page_size, const std::string& query)
 
 		std::string body;
 		std::string last_err;
-		// Primary: new enrollment API (old returns count 0 since ~2026). Fallback keeps old during rollout.
+		// Prefer the new enrollment API, but fall back when it is unavailable or
+		// returns an empty result for accounts still served by the legacy endpoint.
 		for (const char* prefix : {"/api-2.0/users/me/subscription-course-enrollments/",
 		                           "/api-2.0/users/me/subscribed-courses/"}) {
 			try {
-				body = udemy_get(build_url(prefix), 15000);
-				break;
+				std::string candidate = udemy_get(build_url(prefix), 15000);
+				json parsed = json::parse(candidate);
+				bool empty = parsed.contains("results") && parsed["results"].is_array() && parsed["results"].empty();
+				if (body.empty() || !empty) {
+					body = std::move(candidate);
+				}
+				if (!empty) break;
 			} catch (const std::exception& e) {
 				last_err = e.what();
 				// 404 for unknown prefix (e.g. lecture stays on old) -> try fallback
 				if (std::string(e.what()).find("404") == std::string::npos &&
 				    std::string(e.what()).find("Not found") == std::string::npos) {
-					// For courses listing old returns 200 empty, so we only fallback on exception
-					// If primary succeeded but returned empty, still keep it (new is correct)
-					throw;
+					// Keep trying the legacy endpoint; the primary endpoint can return
+					// an empty result for accounts that still have legacy enrollments.
+					continue;
 				}
 			}
 		}
@@ -767,7 +786,7 @@ RequestHandler::handleQueueAdd(const std::string& body) {
 
 		if (j.course_id && !j.course_title.empty())
 		{
-			j.out_path_dir = Helper::course_dir(j.course_id, j.course_title);
+			j.out_path_dir = Helper::course_dir(download_dir_, j.course_id, j.course_title);
 			if (!j.section_title.empty() && j.section_index > 0)
 			{
 				j.out_path_dir += "/" + Helper::section_dir(j.section_index, j.section_title);
@@ -1098,7 +1117,7 @@ std::pair<boost::beast::http::status, std::string> RequestHandler::handleReconci
 		auto it = progress_.find(course_id);
 		if (it != progress_.end() && !it->second.title.empty())
 		{
-			dir = Helper::course_dir(course_id, it->second.title);
+			dir = Helper::course_dir(download_dir_, course_id, it->second.title);
 		}
 	}
 	if (dir.empty())
@@ -1236,6 +1255,13 @@ static size_t file_write(void* ptr, size_t size, size_t nmemb, void* userdata) {
 	return fwrite(ptr, size, nmemb, fp);
 }
 
+static std::string media_proxy_for_url(const std::string& proxy, const std::string& url) {
+	std::string lower = url;
+	std::transform(lower.begin(), lower.end(), lower.begin(),
+		[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	return lower.find("udemycdn.com") != std::string::npos ? std::string{} : proxy;
+}
+
 static int curl_xferinfo_trampoline(void* clientp, curl_off_t dltotal, curl_off_t dlnow, ...) {
 	using CB = std::function<bool(double, double)>; 
 	auto* cb = reinterpret_cast<CB*>(clientp);
@@ -1299,8 +1325,9 @@ bool RequestHandler::curl_download_file(const std::string& url, const std::strin
 	curl_easy_setopt(ch.h, CURLOPT_CONNECTTIMEOUT_MS, 10000L);
 	curl_easy_setopt(ch.h, CURLOPT_TIMEOUT, 0L);
 
-	if (!proxy_.empty()) {
-		curl_easy_setopt(ch.h, CURLOPT_PROXY, proxy_.c_str());
+	const std::string effective_proxy = media_proxy_for_url(proxy_, url);
+	if (!effective_proxy.empty()) {
+		curl_easy_setopt(ch.h, CURLOPT_PROXY, effective_proxy.c_str());
 		curl_easy_setopt(ch.h, CURLOPT_SSL_VERIFYPEER, 0L);
 		curl_easy_setopt(ch.h, CURLOPT_SSL_VERIFYHOST, 0L);
 	}
@@ -2083,8 +2110,9 @@ void RequestHandler::worker_loop() {
 					curl_easy_setopt(ch.h, CURLOPT_WRITEFUNCTION, Helper::write_to_string);
 					curl_easy_setopt(ch.h, CURLOPT_WRITEDATA, &body);
 
-					if (!proxy_.empty()) {
-						curl_easy_setopt(ch.h, CURLOPT_PROXY, proxy_.c_str());
+					const std::string effective_proxy = media_proxy_for_url(proxy_, target_url);
+					if (!effective_proxy.empty()) {
+						curl_easy_setopt(ch.h, CURLOPT_PROXY, effective_proxy.c_str());
 						curl_easy_setopt(ch.h, CURLOPT_SSL_VERIFYPEER, 0L);
 						curl_easy_setopt(ch.h, CURLOPT_SSL_VERIFYHOST, 0L);
 					}
@@ -2262,7 +2290,8 @@ void RequestHandler::worker_loop() {
 						}
 
 						std::cout << "[HLS] Processing local playlist through FFmpeg..." << std::endl;
-						ok = FFmpegHelper::convert_m3u8_to_ts(local_m3u8_path, j.out_path, safe_headers, proxy_, on_progress, msg);
+				ok = FFmpegHelper::convert_m3u8_to_ts(local_m3u8_path, j.out_path, safe_headers,
+					media_proxy_for_url(proxy_, j.url), on_progress, msg);
 
 						std::error_code ec_rem;
 						std::filesystem::remove(std::filesystem::u8path(local_m3u8_path), ec_rem);

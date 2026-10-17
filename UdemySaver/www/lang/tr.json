@@ -48,6 +48,7 @@
   "options.assets": "Ek materyalleri indir",
   "options.language": "Dil",
   "options.quality": "Video kalitesi",
+  "options.download_dir": "İndirme klasörü",
   "settings.title": "Ayarlar",
   "queue.speed": "Hız: {speed}/s",
   "queue.sections": "Dosya",
